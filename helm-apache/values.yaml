@@ -1,0 +1,28 @@
+app1:
+  name: app1
+  image:
+    repository: httpd
+    tag: 2.4.59-bookworm
+  replicas: 1
+  service:
+    port: 80
+  ingress:
+    path: /app1
+    pathType: Prefix
+
+app2:
+  name: app2
+  image:
+    repository: httpd
+    tag: 2.4.60-bookworm
+  replicas: 1
+  service:
+    port: 80
+  ingress:
+    path: /app2
+    pathType: Prefix
+
+ingress:
+  className: nginx
+  annotations:
+    rewriteTarget: /

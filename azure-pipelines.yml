@@ -1,0 +1,161 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - 'tf/**'
+      - 'helm-apache/**'
+      - azure-pipelines.yml
+
+pool:
+  name: default
+  demands:
+    - agent.name -equals demo-agent
+
+parameters:
+  - name: environ
+    displayName: Environment
+    type: string
+    default: dev
+    values:
+      - prod
+      - dev
+  - name: terraformVersion
+    type: string
+    default: '1.9.8'
+  - name: helmVersion
+    type: string
+    default: '3.16.3'
+
+variables:
+  # Common variables
+  resourceGroup: 'demo-task'
+  vaultName: 'demo-vault-v1'
+  vaultSubIdKey: 'sub-id'
+  vaultBackendAccessKey: 'backend-access-key'
+  helmReleaseName: 'apache-apps'
+  backendStorageAccountName: 'tfstate8y4rz'
+  backendContainerName: 'tfstate'
+  
+  # Environment-specific variables
+  ${{ if eq(parameters.environ, 'dev') }}:
+    environment: dev
+    clusterName: 'aks-demo-dev'
+    tfVarsFile: '../dev.tfvars'
+    tfStateKey: 'dev.terraform.state'
+  ${{ if eq(parameters.environ, 'prod') }}:
+    environment: prod
+    clusterName: 'aks-demo-prod'
+    tfVarsFile: '../prod.tfvars'
+    tfStateKey: 'prod.terraform.state'
+
+stages:
+- stage: Validate
+  jobs:
+    - job: ValidateInfrastructure
+      steps:
+        - task: TerraformInstaller@1
+          inputs:
+            terraformVersion: ${{ parameters.terraformVersion }}
+          displayName: Install Terraform
+
+        - task: AzureCLI@2
+          inputs:
+            azureSubscription: 'demo-conn'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            addSpnToEnvironment: false
+            inlineScript: |
+              set -e
+              cd tf/k8s
+              
+              # Validate Terraform files
+              terraform fmt -check
+          displayName: 'Validate Terraform Configuration'
+          
+        - task: HelmInstaller@1
+          inputs: 
+            helmVersionToInstall: ${{ parameters.helmVersion }}
+          displayName: Install Helm
+            
+        - script: |
+            helm lint $(System.DefaultWorkingDirectory)/helm-apache
+          displayName: 'Validate Helm Chart'
+
+- stage: InfrastructureSetup
+  dependsOn: Validate
+  condition: succeeded('Validate')
+  jobs:
+    - deployment: DeployInfrastructure
+      environment: $(environment)
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: TerraformInstaller@1
+                inputs:
+                  terraformVersion: ${{ parameters.terraformVersion }}
+                displayName: Install Terraform
+
+              - task: AzureCLI@2
+                inputs:
+                  azureSubscription: 'demo-conn'
+                  scriptType: 'bash'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+                    set -e
+                    cd tf/k8s
+
+                    # Get secrets from Key Vault
+                    echo "Getting secrets from Key Vault..."
+                    SUB_ID=$(az keyvault secret show --name $(vaultSubIdKey) --vault-name $(vaultName) --query "value" -o tsv)
+                    ACCESS_KEY=$(az keyvault secret show --name $(vaultBackendAccessKey) --vault-name $(vaultName) --query "value" -o tsv)
+                    
+                    export ARM_SUBSCRIPTION_ID="$SUB_ID"
+                    
+                    # Initialize Terraform
+                    echo "Initializing Terraform..."
+                    terraform init \
+                      -backend-config="access_key=$ACCESS_KEY" \
+                      -backend-config="storage_account_name=$(backendStorageAccountName)" \
+                      -backend-config="container_name=$(backendContainerName)" \
+                      -backend-config="key=$(tfStateKey)"
+                    
+                    # Plan and apply
+                    echo "Creating Terraform plan..."
+                    terraform plan -out=tfplan -input=false -var-file=$(tfVarsFile)
+                    
+                    echo "Applying Terraform plan..."
+                    terraform apply -auto-approve tfplan
+                displayName: 'Provision AKS cluster'
+                continueOnError: false
+
+- stage: Deploy
+  dependsOn: InfrastructureSetup
+  condition: succeeded('InfrastructureSetup')
+  jobs:
+    - deployment: DeployToAKS
+      environment: $(environment)
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: HelmInstaller@1
+                displayName: Install Helm
+                inputs: 
+                  helmVersionToInstall: ${{ parameters.helmVersion }}
+
+              - task: HelmDeploy@1
+                inputs:
+                  connectionType: 'Azure Resource Manager'
+                  azureSubscription: "demo-conn"
+                  azureResourceGroup: $(resourceGroup)
+                  kubernetesCluster: $(clusterName)
+                  command: 'upgrade'
+                  chartType: FilePath
+                  chartPath: '$(System.DefaultWorkingDirectory)/helm-apache'
+                  releaseName: $(helmReleaseName)
+                  install: true
+                  arguments: "--atomic --force --timeout 10m0s --wait"
+                displayName: 'Deploy Helm Chart'
